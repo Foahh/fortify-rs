@@ -1,0 +1,87 @@
+# Fortify configuration.
+version = 1
+
+ignore = [
+    "desktop.ini",
+    "Thumbs.db",
+    "*.parts",
+    "*.part",
+    "*.crdownload",
+    "*.download",
+    "*.tmp",
+    "*.temp",
+    "**/Duplicates/**"
+]
+
+[mapping]
+
+Documents = [
+    "doc", "docx", "pdf", "txt", "ppt", "pptx", "xls", "xlsx",
+    "csv", "rtf", "tex", "md", "odt", "ods", "odp",
+    "pages", "numbers", "keynote", "key", "xps", "oxps",
+    "docm", "dot", "dotx", "dotm", "xlsm", "xlsb", "xlt", "xltx", "xltm",
+    "pptm", "pps", "ppsx", "ppsm", "pot", "potx", "potm",
+    "tsv", "markdown", "rst", "log", "ott", "ots", "otp", "odg"
+]
+
+Pictures = [
+    "jpg", "jpeg", "png", "gif", "bmp", "svg",
+    "tiff", "tif", "webp", "ico", "heic", "heif", "raw", "psd", "ai", "eps", "avif",
+    "jxl", "jfif", "jpe", "apng", "svgz", "psb", "xcf", "kra", "ora",
+    "dng", "cr2", "cr3", "nef", "nrw", "arw", "raf", "orf", "rw2",
+    "tga", "dds", "exr", "hdr", "icns"
+]
+
+Music = [
+    "mp3", "wav", "wma", "ogg", "flac", "aac", "m4a", "mid",
+    "opus", "wv", "ape", "aiff", "aif", "aifc", "alac", "m4b", "m4p",
+    "oga", "mka", "amr", "ac3", "eac3", "dts", "midi", "aax"
+]
+
+Video = [
+    "mp4", "avi", "mkv", "flv", "mov", "wmv", "webm",
+    "mpg", "mpeg", "m4v", "3gp", "3g2", "vob",
+    "m2ts", "mts", "m2v", "mpe", "ogv", "asf", "f4v", "divx", "mxf"
+]
+
+Compressed = [
+    "zip", "rar", "r0*", "r1*", "arj", "7z", "tar", "gz", "bz2",
+    "xz", "zst", "lz", "cab", "iso", "img",
+    "tgz", "tbz", "tbz2", "txz", "tzst", "bz", "gzip", "lzma", "lz4",
+    "lzh", "lha", "zipx", "z", "cpio", "wim", "esd"
+]
+
+Programs = [
+    "exe", "msi", "bat", "sh", "jar", "apk", "deb",
+    "rpm", "dmg", "appimage", "cmd", "ps1", "com",
+    "run", "bin", "app", "snap", "flatpak",
+    "msix", "msixbundle", "appx", "appxbundle", "appinstaller", "msp", "msu",
+    "apks", "xapk", "apkm", "aab", "ipa", "pkg", "flatpakref", "flatpakrepo"
+]
+
+Code = [
+    "py", "java", "cpp", "c", "cs", "html", "css", "js", "php",
+    "sql", "ino", "json", "ts", "tsx", "jsx", "rs", "go", "rb",
+    "swift", "kt", "scala", "lua", "r", "dart", "vue", "svelte",
+    "yml", "yaml", "xml", "toml", "ini", "cfg", "conf",
+    "pyw", "pyi", "ipynb", "h", "hpp", "hxx", "cc", "cxx", "hh",
+    "htm", "xhtml", "scss", "sass", "less", "mjs", "cjs", "cts",
+    "jsonc", "json5", "jsonl", "ndjson", "kts", "ex", "exs", "erl", "hrl",
+    "hs", "jl", "pl", "pm", "psm1", "psd1", "graphql", "gql", "proto",
+    "tf", "tfvars", "hcl", "cmake", "gradle", "diff", "patch", "wasm"
+]
+
+Fonts = ["ttf", "otf", "woff", "woff2", "eot", "ttc", "otc", "pfb", "pfm", "bdf", "pcf"]
+
+Ebooks = ["epub", "mobi", "azw", "azw3", "azw4", "kfx", "fb2", "djvu", "djv", "cbz", "cbr", "cb7", "cbt"]
+
+Models = [
+    "stl", "obj", "fbx", "blend", "3ds", "dae", "gltf", "glb",
+    "3mf", "step", "stp", "iges", "igs", "ply", "usd", "usda", "usdc", "usdz",
+    "abc", "3dm", "skp", "gcode"
+]
+
+Torrents = ["torrent"]
+
+Databases = ["db", "sqlite", "sqlite3", "db3", "sqlite2", "mdb", "accdb", "duckdb", "parquet", "arrow", "feather", "avro", "orc"]
+

@@ -1,0 +1,53 @@
+name: Rust CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: ""
+          - os: windows-latest
+            suffix: ".exe"
+          - os: macos-latest
+            suffix: ""
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo build --locked --release --bins
+      - name: Package binaries
+        shell: bash
+        env:
+          FORTIFY_SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp "target/release/fortify${FORTIFY_SUFFIX}" package/
+          cp "target/release/fortify-runner${FORTIFY_SUFFIX}" package/
+          cp README.md CONTRIBUTING.md config.toml package/
+          cp -R docs package/
+          tar -czf fortify.tar.gz -C package .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fortify-${{ runner.os }}-${{ runner.arch }}
+          path: fortify.tar.gz
+          if-no-files-found: error
