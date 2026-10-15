@@ -230,6 +230,111 @@ fn changed_source_is_refused_even_when_size_and_mtime_match() {
 }
 
 #[test]
+fn changed_source_with_existing_parent_preserves_previous_undo() {
+    let temp = TempDir::new().unwrap();
+    put(temp.path(), "first.pdf", "first");
+    engine::apply(temp.path(), &config(), options()).unwrap();
+    let previous = fs::read(journal::last(temp.path())).unwrap();
+    put(temp.path(), "next.pdf", "aaaa");
+    modified(&temp.path().join("next.pdf"), 1000);
+    let plan = engine::preview(temp.path(), &config(), options()).unwrap();
+
+    put(temp.path(), "next.pdf", "bbbb");
+    modified(&temp.path().join("next.pdf"), 1000);
+    let result = engine::apply_plan(plan, &mut DiskJournal);
+
+    assert!(result.is_err());
+    assert!(!journal::pending(temp.path()).exists());
+    assert_eq!(fs::read(journal::last(temp.path())).unwrap(), previous);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("next.pdf")).unwrap(),
+        "bbbb"
+    );
+    engine::undo(temp.path()).unwrap();
+    assert!(temp.path().join("first.pdf").exists());
+}
+
+#[test]
+fn changed_unmoved_source_does_not_obstruct_partial_run_recovery() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("Documents")).unwrap();
+    put(temp.path(), "first.pdf", "first");
+    put(temp.path(), "second.pdf", "aaaa");
+    modified(&temp.path().join("first.pdf"), 2000);
+    modified(&temp.path().join("second.pdf"), 1000);
+    let plan = engine::preview(temp.path(), &config(), options()).unwrap();
+
+    put(temp.path(), "second.pdf", "bbbb");
+    modified(&temp.path().join("second.pdf"), 1000);
+    let result = engine::apply_plan(plan, &mut DiskJournal);
+    engine::undo(temp.path()).unwrap();
+
+    assert!(matches!(result, Err(Error::Partial { .. })));
+    assert!(temp.path().join("first.pdf").exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("second.pdf")).unwrap(),
+        "bbbb"
+    );
+}
+
+struct EditAfterIntent {
+    undo: bool,
+}
+
+impl JournalWriter for EditAfterIntent {
+    fn write(&mut self, path: &Path, journal: &Journal) -> Result<()> {
+        DiskJournal.write(path, journal)
+    }
+
+    fn write_record(&mut self, path: &Path, journal: &Journal, index: usize) -> Result<()> {
+        DiskJournal.write_record(path, journal, index)?;
+        let record = &journal.records[index];
+        let expected = if self.undo {
+            journal::State::Undoing
+        } else {
+            journal::State::Prepared
+        };
+        if record.state == expected
+            && let journal::Operation::Move { from, to, .. } = &record.operation
+        {
+            let source = journal.root.join(if self.undo { to } else { from });
+            fs::write(&source, "bbbb").unwrap();
+            modified(&source, 1000);
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+fn apply_and_undo_recheck_contents_after_durable_intent() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("Documents")).unwrap();
+    put(temp.path(), "report.pdf", "aaaa");
+    modified(&temp.path().join("report.pdf"), 1000);
+    let plan = engine::preview(temp.path(), &config(), options()).unwrap();
+
+    assert!(engine::apply_plan(plan, &mut EditAfterIntent { undo: false }).is_err());
+
+    assert!(!temp.path().join("Documents/report.pdf").exists());
+    assert!(!journal::pending(temp.path()).exists());
+    put(temp.path(), "report.pdf", "aaaa");
+    modified(&temp.path().join("report.pdf"), 1000);
+    engine::apply(temp.path(), &config(), options()).unwrap();
+
+    assert!(engine::undo_with_writer(temp.path(), &mut EditAfterIntent { undo: true }).is_err());
+
+    assert!(!temp.path().join("report.pdf").exists());
+    put(temp.path(), "Documents/report.pdf", "aaaa");
+    modified(&temp.path().join("Documents/report.pdf"), 1000);
+    engine::undo(temp.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(temp.path().join("report.pdf")).unwrap(),
+        "aaaa"
+    );
+}
+
+#[test]
 fn partial_apply_stops_and_can_undo() {
     let temp = TempDir::new().unwrap();
     put(temp.path(), "first.pdf", "first");
@@ -293,14 +398,26 @@ struct FailWrite {
     count: usize,
 }
 
-impl JournalWriter for FailWrite {
-    fn write(&mut self, path: &Path, journal: &Journal) -> Result<()> {
+impl FailWrite {
+    fn check(&mut self) -> Result<()> {
         self.count += 1;
         if self.count == self.at {
             return Err(Error::Operation("injected journal write failure".into()));
         }
 
+        Ok(())
+    }
+}
+
+impl JournalWriter for FailWrite {
+    fn write(&mut self, path: &Path, journal: &Journal) -> Result<()> {
+        self.check()?;
         DiskJournal.write(path, journal)
+    }
+
+    fn write_record(&mut self, path: &Path, journal: &Journal, index: usize) -> Result<()> {
+        self.check()?;
+        DiskJournal.write_record(path, journal, index)
     }
 }
 
@@ -578,6 +695,12 @@ fn every_apply_journal_boundary_remains_recoverable() {
             !temp.path().join("Documents").exists(),
             "failure {at} left directory"
         );
+        assert!(
+            fs::read_dir(temp.path().join(".fortify"))
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_type().unwrap().is_dir()),
+            "failure {at} leaked journal staging"
+        );
     }
 }
 
@@ -596,6 +719,121 @@ fn every_undo_journal_boundary_is_retryable() {
         assert!(temp.path().join("report.pdf").exists());
         assert!(!temp.path().join("Documents").exists());
     }
+}
+
+#[test]
+fn torn_pending_append_is_compacted_before_recovery_continues() {
+    use std::io::Write;
+
+    let temp = TempDir::new().unwrap();
+    put(temp.path(), "report.pdf", "data");
+    let plan = engine::preview(temp.path(), &config(), options()).unwrap();
+    assert!(engine::apply_plan(plan, &mut FailWrite { at: 5, count: 0 }).is_err());
+    let path = journal::pending(temp.path());
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{\"update\":{\"staging\":").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    // Interrupt recovery too, after its first reverse rename. The next read
+    // must replay a clean snapshot and updates, without the original torn tail.
+    assert!(engine::undo_with_writer(temp.path(), &mut FailWrite { at: 3, count: 0 }).is_err());
+    engine::undo(temp.path()).unwrap();
+
+    assert!(temp.path().join("report.pdf").exists());
+    assert!(!temp.path().join("Documents").exists());
+    assert!(!path.exists());
+}
+
+#[test]
+fn legacy_undo_history_survives_migration_and_interruption() {
+    let temp = TempDir::new().unwrap();
+    put(temp.path(), "report.pdf", "data");
+    engine::apply(temp.path(), &config(), options()).unwrap();
+    let root = filesystem::target(temp.path()).unwrap();
+    let path = journal::last(&root);
+    let mut legacy = journal::read(&path, &root).unwrap().unwrap();
+    legacy.version = 1;
+    fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    assert!(engine::undo_with_writer(&root, &mut FailWrite { at: 3, count: 0 }).is_err());
+    let migrated = journal::read(&path, &root).unwrap().unwrap();
+    engine::undo(&root).unwrap();
+
+    assert_eq!(migrated.version, 2);
+    assert!(temp.path().join("report.pdf").exists());
+    assert!(!temp.path().join("Documents").exists());
+}
+
+#[derive(Default)]
+struct CountJournalBytes(u64);
+
+impl JournalWriter for CountJournalBytes {
+    fn write(&mut self, path: &Path, journal: &Journal) -> Result<()> {
+        DiskJournal.write(path, journal)?;
+        self.0 += fs::metadata(path).unwrap().len();
+
+        Ok(())
+    }
+
+    fn write_record(&mut self, path: &Path, journal: &Journal, index: usize) -> Result<()> {
+        let before = fs::metadata(path).unwrap().len();
+        DiskJournal.write_record(path, journal, index)?;
+        self.0 += fs::metadata(path).unwrap().len() - before;
+
+        Ok(())
+    }
+}
+
+#[test]
+fn journal_bytes_scale_linearly_for_apply_and_undo() {
+    let mut measurements = vec![];
+
+    for count in [16, 64] {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("Documents")).unwrap();
+        for index in 0..count {
+            put(temp.path(), &format!("file-{index:03}.pdf"), "data");
+        }
+        let plan = engine::preview(temp.path(), &config(), options()).unwrap();
+        let mut apply_writer = CountJournalBytes::default();
+        let mut undo_writer = CountJournalBytes::default();
+
+        engine::apply_plan(plan, &mut apply_writer).unwrap();
+        let undone = engine::undo_with_writer(temp.path(), &mut undo_writer).unwrap();
+
+        assert_eq!(undone, count);
+        for index in 0..count {
+            assert_eq!(
+                fs::read_to_string(temp.path().join(format!("file-{index:03}.pdf"))).unwrap(),
+                "data"
+            );
+        }
+        measurements.push((apply_writer.0, undo_writer.0));
+    }
+
+    // Four times the operations must stay near four times the bytes, rather
+    // than the sixteen-fold growth of rewriting the entire journal each time.
+    assert!(measurements[1].0 < measurements[0].0 * 5);
+    assert!(measurements[1].1 < measurements[0].1 * 5);
+}
+
+#[test]
+fn journal_appends_refuse_hard_links_and_non_regular_targets() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("journal.json");
+    let alias = temp.path().join("alias.json");
+    fs::write(&path, "original").unwrap();
+    fs::hard_link(&path, &alias).unwrap();
+    let missing = temp.path().join("missing.json");
+
+    assert!(filesystem::append_synced(&path, b"update").is_err());
+    assert!(filesystem::append_synced(temp.path(), b"update").is_err());
+    assert!(filesystem::append_synced(&missing, b"update").is_err());
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    assert_eq!(fs::read_to_string(&alias).unwrap(), "original");
+    assert!(!missing.exists());
 }
 
 #[test]

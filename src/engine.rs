@@ -80,7 +80,7 @@ fn execute(plan: Plan, writer: &mut dyn JournalWriter) -> Result<ApplyReport> {
     let _kept = temporary.keep();
 
     let mut journal = Journal {
-        version: 1,
+        version: 2,
         root: root.clone(),
         root_identity: filesystem::identity(&root)?,
         staging,
@@ -101,7 +101,7 @@ fn execute(plan: Plan, writer: &mut dyn JournalWriter) -> Result<ApplyReport> {
                     ..
                 } => {
                     let source = filesystem::checked_path(&root, from)?;
-                    verify_file(&source, stamp, digest)?;
+                    filesystem::verify_stamp(&source, stamp)?;
 
                     let destination = filesystem::checked_path(&root, to)?;
                     if filesystem::metadata(&destination)?.is_some() {
@@ -111,7 +111,14 @@ fn execute(plan: Plan, writer: &mut dyn JournalWriter) -> Result<ApplyReport> {
                         )));
                     }
 
-                    ensure_parents(&mut journal, to.parent().unwrap_or(Path::new("")), writer)?;
+                    let parent = to.parent().unwrap_or(Path::new(""));
+                    if filesystem::metadata(&root.join(parent))?.is_none() {
+                        // Reject changed contents before creating target directories.
+                        // Existing parents need only the final check inside perform.
+                        verify_file(&source, stamp, digest)?;
+                    }
+
+                    ensure_parents(&mut journal, parent, writer)?;
                     record_and_apply(
                         &mut journal,
                         Operation::Move {
@@ -178,7 +185,7 @@ fn execute(plan: Plan, writer: &mut dyn JournalWriter) -> Result<ApplyReport> {
             let mut ambiguous = false;
 
             for record in &journal.records {
-                match position(&journal, &record.operation) {
+                match verified_position(&journal, &record.operation) {
                     Ok(Position::After) => changed = true,
                     Ok(Position::Before) => {}
                     Err(_) => ambiguous = true,
@@ -251,12 +258,34 @@ fn record_and_apply(
         operation: operation.clone(),
         state: State::Prepared,
     });
-    writer.write(&journal::pending(&journal.root), journal)?;
+    let index = journal.records.len() - 1;
+    let path = journal::pending(&journal.root);
+    let mut attempted = false;
+    let result = (|| {
+        writer.write_record(&path, journal, index)?;
+        perform(journal, &operation, false, &mut attempted)
+    })();
 
-    perform(journal, &operation, false)?;
+    if let Err(error) = result {
+        if !attempted {
+            // Retire a provably unmoved file intent so changed contents cannot
+            // obstruct recovery of earlier operations. Keep directory records
+            // for staging cleanup, and ambiguous positions for recovery checks.
+            if matches!(operation, Operation::Move { .. })
+                && position(journal, &operation).is_ok_and(|(_, p)| p == Position::Before)
+            {
+                journal.records.pop();
+            }
+
+            // A checkpoint on this error path also removes any torn append.
+            writer.write(&path, journal)?;
+        }
+
+        return Err(error);
+    }
 
     journal.records.last_mut().unwrap().state = State::Done;
-    writer.write(&journal::pending(&journal.root), journal)
+    writer.write_record(&path, journal, index)
 }
 
 fn verify_file(path: &Path, stamp: &filesystem::Stamp, digest: &str) -> Result<()> {
@@ -300,7 +329,7 @@ enum Position {
     After,
 }
 
-fn position(journal: &Journal, operation: &Operation) -> Result<Position> {
+fn position(journal: &Journal, operation: &Operation) -> Result<(std::path::PathBuf, Position)> {
     let (from, to) = endpoints(journal, operation)?;
     let before = filesystem::metadata(&from)?.is_some();
     let after = filesystem::metadata(&to)?.is_some();
@@ -318,7 +347,7 @@ fn position(journal: &Journal, operation: &Operation) -> Result<Position> {
     };
 
     match operation {
-        Operation::Move { stamp, digest, .. } => verify_file(path, stamp, digest)?,
+        Operation::Move { stamp, .. } => filesystem::verify_stamp(path, stamp)?,
         Operation::Directory { identity, .. } => {
             let meta = fs::symlink_metadata(path).context("inspect recorded directory")?;
             if filesystem::is_link(&meta)
@@ -331,6 +360,15 @@ fn position(journal: &Journal, operation: &Operation) -> Result<Position> {
                 )));
             }
         }
+    }
+
+    Ok((path.clone(), position))
+}
+
+fn verified_position(journal: &Journal, operation: &Operation) -> Result<Position> {
+    let (path, position) = position(journal, operation)?;
+    if let Operation::Move { stamp, digest, .. } = operation {
+        verify_file(&path, stamp, digest)?;
     }
 
     Ok(position)
@@ -362,14 +400,19 @@ fn endpoints(
     }
 }
 
-fn perform(journal: &Journal, operation: &Operation, undo: bool) -> Result<()> {
+fn perform(
+    journal: &Journal,
+    operation: &Operation,
+    undo: bool,
+    mutation_attempted: &mut bool,
+) -> Result<()> {
     let expected = if undo {
         Position::After
     } else {
         Position::Before
     };
 
-    if position(journal, operation)? != expected {
+    if verified_position(journal, operation)? != expected {
         return Err(Error::Recovery(
             "operation has already moved; retry undo to reconcile".into(),
         ));
@@ -380,6 +423,8 @@ fn perform(journal: &Journal, operation: &Operation, undo: bool) -> Result<()> {
     if matches!(operation, Operation::Directory { .. }) {
         ensure_empty(&from)?;
     }
+
+    *mutation_attempted = true;
 
     filesystem::rename_no_replace(&from, &to)
 }
@@ -401,8 +446,10 @@ pub fn undo_with_writer(target: &Path, writer: &mut dyn JournalWriter) -> Result
     };
 
     let mut reversed = 0;
+    let mut mutation_attempted = false;
     let mut had_changes = journal.records.iter().any(|r| r.state != State::Prepared);
     journal.complete = false;
+    journal.version = 2;
     writer.write(&path, &journal)?;
 
     // Reverse order is essential: child moves must be restored before their parent directory.
@@ -412,18 +459,20 @@ pub fn undo_with_writer(target: &Path, writer: &mut dyn JournalWriter) -> Result
             continue;
         }
 
-        let actual = position(&journal, &record.operation)?;
+        let (_, actual) = position(&journal, &record.operation)?;
 
         match record.state {
             State::Prepared if actual == Position::Before => {
+                verified_position(&journal, &record.operation)?;
                 journal.records[i].state = State::Undone;
-                writer.write(&path, &journal)?;
+                writer.write_record(&path, &journal, i)?;
                 continue;
             }
 
             State::Undoing if actual == Position::Before => {
+                verified_position(&journal, &record.operation)?;
                 journal.records[i].state = State::Undone;
-                writer.write(&path, &journal)?;
+                writer.write_record(&path, &journal, i)?;
                 had_changes = true;
                 continue;
             }
@@ -439,12 +488,12 @@ pub fn undo_with_writer(target: &Path, writer: &mut dyn JournalWriter) -> Result
 
         had_changes = true;
         journal.records[i].state = State::Undoing;
-        writer.write(&path, &journal)?;
+        writer.write_record(&path, &journal, i)?;
 
-        perform(&journal, &record.operation, true)?;
+        perform(&journal, &record.operation, true, &mut mutation_attempted)?;
 
         journal.records[i].state = State::Undone;
-        writer.write(&path, &journal)?;
+        writer.write_record(&path, &journal, i)?;
         reversed += 1;
     }
 
@@ -463,4 +512,33 @@ pub fn undo_with_writer(target: &Path, writer: &mut dyn JournalWriter) -> Result
     journal::remove_file(&path)?;
 
     Ok(reversed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_directory_moves_and_undo_have_bounded_content_reads() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config::parse("version = 1", None).unwrap();
+        let options = Operations {
+            sort: true,
+            duplicates: false,
+            prune: false,
+        };
+        let contents = vec![42; 128 * 1024];
+        fs::create_dir(temp.path().join("Others")).unwrap();
+        fs::write(temp.path().join("file.bin"), &contents).unwrap();
+        filesystem::HASH_BYTES.with(|bytes| bytes.set(0));
+
+        apply(temp.path(), &config, options).unwrap();
+        let apply_bytes = filesystem::HASH_BYTES.with(|bytes| bytes.replace(0));
+        undo(temp.path()).unwrap();
+        let undo_bytes = filesystem::HASH_BYTES.with(|bytes| bytes.get());
+
+        assert_eq!(apply_bytes, contents.len() as u64 * 2);
+        assert_eq!(undo_bytes, contents.len() as u64);
+        assert_eq!(fs::read(temp.path().join("file.bin")).unwrap(), contents);
+    }
 }

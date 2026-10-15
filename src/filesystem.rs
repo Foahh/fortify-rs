@@ -10,6 +10,11 @@ use std::{
 
 pub const INTERNAL: &str = ".fortify";
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HASH_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -220,6 +225,9 @@ pub fn hash(path: &Path) -> Result<String> {
         }
 
         hasher.update(&buffer[..n]);
+
+        #[cfg(test)]
+        HASH_BYTES.with(|bytes| bytes.set(bytes.get() + n as u64));
     }
 
     Ok(hasher.finalize().to_hex().to_string())
@@ -372,6 +380,73 @@ pub fn create_new(path: &Path, content: &[u8]) -> Result<()> {
     file.write_all(content).context("write new file")?;
     file.sync_all().context("flush new file")?;
     sync_parent(path)
+}
+
+pub fn append_synced(path: &Path, content: &[u8]) -> Result<()> {
+    let meta =
+        metadata(path)?.ok_or_else(|| Error::Recovery("journal snapshot is missing".into()))?;
+    if is_link(&meta) || !meta.is_file() {
+        return Err(Error::Recovery("journal is not a regular file".into()));
+    }
+
+    // The executor owns the target lock and stops after any append failure.
+    // A resumed run first replaces the snapshot, removing any torn tail.
+    let mut options = OpenOptions::new();
+    options.append(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+
+    let mut file = options.open(path).context("open journal for append")?;
+    let opened = file.metadata().context("inspect opened journal")?;
+    if is_link(&opened) || !opened.is_file() || !single_link(&file, &opened)? {
+        return Err(Error::Recovery(
+            "journal must be a regular file with one link".into(),
+        ));
+    }
+
+    file.write_all(content).context("append journal record")?;
+    file.sync_all().context("flush journal record")
+}
+
+fn single_link(file: &File, meta: &Metadata) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let _ = file;
+
+        Ok(meta.nlink() == 1)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+
+        let _ = meta;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+
+        // SAFETY: file owns a live handle and info is writable for the call.
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(|e| Error::Recovery(format!("inspect journal links: {e}")))?;
+
+        Ok(info.nNumberOfLinks == 1)
+    }
 }
 
 pub struct TargetLock {
