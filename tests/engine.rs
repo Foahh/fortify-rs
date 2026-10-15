@@ -924,7 +924,23 @@ fn non_unicode_names_are_refused_before_mutation() {
     let path = temp.path().join(std::ffi::OsString::from_vec(vec![
         0xff, b'.', b'p', b'd', b'f',
     ]));
-    fs::write(&path, "data").unwrap();
+
+    // Validate the guard even on filesystems that cannot store this fixture.
+    let error = fortify::paths::utf8(&path).unwrap_err();
+
+    assert!(error.to_string().contains("path is not valid Unicode"));
+    assert!(!temp.path().join(".fortify").exists());
+
+    match fs::write(&path, "data") {
+        Ok(()) => {}
+        // APFS rejects invalid UTF-8 before the scanner can encounter it.
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
+            eprintln!("filesystem rejects non-Unicode names; path validation checked directly");
+            return;
+        }
+        Err(error) => panic!("create non-Unicode filename fixture: {error}"),
+    }
 
     assert!(engine::preview(temp.path(), &config(), options()).is_err());
     assert!(path.exists());
