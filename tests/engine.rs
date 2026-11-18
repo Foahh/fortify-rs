@@ -5,7 +5,11 @@ use fortify::{
     journal::{self, DiskJournal, Journal, JournalWriter},
     plan::Action,
 };
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, UNIX_EPOCH},
+};
 use tempfile::TempDir;
 
 fn config() -> Config {
@@ -26,8 +30,10 @@ fn put(root: &Path, relative: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-fn modified(path: &Path, seconds: i64) {
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+fn modified(path: &Path, seconds: u64) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+        .unwrap();
 }
 
 fn moves(plan: &fortify::plan::Plan) -> Vec<(&Path, &Path, &str)> {
