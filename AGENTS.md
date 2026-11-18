@@ -1,8 +1,6 @@
 # Fortify
 
-Use Cargo and Rust tools in this repository.
-
-- Run `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, and `cargo test --locked --all-features` for code changes.
+- Run the [code-change checks](CONTRIBUTING.md#build-and-check).
 - Use blank lines between items, methods, and logical steps; separate test setup, actions, and assertions.
 - Split long configuration fixtures and scheduler templates across readable lines.
 - Keep filesystem mutation inside the executor and native filesystem adapter.
